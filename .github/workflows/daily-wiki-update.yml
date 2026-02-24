@@ -1,0 +1,73 @@
+# ============================================================
+# Daily Wiki Update - Tracks all AntonMFernando-NOAA repos
+# ============================================================
+
+name: Daily Wiki Update
+
+on:
+  schedule:
+    - cron: '0 6 * * 1-5'       # 06:00 UTC Mon-Fri (weekdays only)
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Date to summarise (YYYY-MM-DD). Leave blank for yesterday.'
+        required: false
+        default: ''
+
+jobs:
+  update-wiki:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Generate daily summary
+        env:
+          GH_TOKEN: ${{ secrets.WIKI_PAT }}
+          GITHUB_ACTOR: ${{ vars.GITHUB_ACTOR || 'AntonMFernando-NOAA' }}
+          SUMMARY_DATE: ${{ inputs.date }}
+        run: python generate_daily_summary.py
+
+      - name: Push to global-workflow wiki
+        env:
+          WIKI_PAT: ${{ secrets.WIKI_PAT }}
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Clone the global-workflow wiki
+          git clone https://x-access-token:${WIKI_PAT}@github.com/AntonMFernando-NOAA/global-workflow.wiki.git wiki
+          cd wiki
+
+          # Create Daily-Updates.md with header if it doesn't exist
+          if [ ! -f Daily-Updates.md ]; then
+            printf '# Daily Updates\n\nAutomatically generated daily activity summaries across all AntonMFernando-NOAA repositories.\n\n---\n\n' \
+              > Daily-Updates.md
+          fi
+
+          # Prepend new entry (newest at top)
+          cat ../daily_summary_patch.md Daily-Updates.md > tmp_updates.md
+          mv tmp_updates.md Daily-Updates.md
+
+          # Add sidebar link if missing
+          if [ ! -f _Sidebar.md ]; then
+            echo "* [[Home]]" > _Sidebar.md
+          fi
+          if ! grep -q 'Daily-Updates' _Sidebar.md; then
+            printf '\n* [[Daily Updates|Daily-Updates]]\n' >> _Sidebar.md
+          fi
+
+          git add Daily-Updates.md _Sidebar.md
+          git diff --cached --quiet \
+            || (git commit -m "Daily wiki update: $(date -u +%Y-%m-%d)" && git push)
