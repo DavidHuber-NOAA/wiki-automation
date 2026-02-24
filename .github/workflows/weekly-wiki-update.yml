@@ -6,7 +6,7 @@ name: Weekly Wiki Update
 
 on:
   schedule:
-    - cron: '0 18 * * 5'        # 18:00 UTC on Fridays (6pm)
+    - cron: '59 23 * * 5'        # 23:59 UTC on Fridays (11:59 PM)
   workflow_dispatch:
     inputs:
       week_start:
