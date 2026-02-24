@@ -7,7 +7,7 @@ name: Daily Wiki Update
 
 on:
   schedule:
-    - cron: '0 10 * * 1-5'       # 10:00 UTC Mon-Fri (weekdays only)
+    - cron: '0 18 * * 1-5'       # 18:00 UTC Mon-Fri (6pm) (weekdays only)
   workflow_dispatch:
     inputs:
       date:
