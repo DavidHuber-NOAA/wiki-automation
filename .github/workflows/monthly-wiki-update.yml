@@ -1,0 +1,92 @@
+# ============================================================
+# Monthly Progress Report
+# Runs on the last day of each month at 23:30 UTC.
+# Updates this repository's wiki with a Monthly-Updates.md page.
+# ============================================================
+
+name: Monthly Wiki Update
+
+on:
+  schedule:
+    - cron: '30 23 28-31 * *'   # 23:30 UTC on days 28-31; script guards last-day-only
+  workflow_dispatch:
+    inputs:
+      month:
+        description: 'Month to summarise (YYYY-MM). Leave blank for last month.'
+        required: false
+        default: ''
+
+jobs:
+  update-wiki:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check if today is the last day of the month
+        id: check_last_day
+        if: github.event_name == 'schedule'
+        run: |
+          today=$(date -u +%d)
+          last=$(date -u -d "$(date -u +%Y-%m-01) +1 month -1 day" +%d)
+          if [ "$today" != "$last" ]; then
+            echo "Not the last day of the month ($today vs $last). Skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout repository
+        if: steps.check_last_day.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        if: steps.check_last_day.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        if: steps.check_last_day.outputs.skip != 'true'
+        run: pip install requests
+
+      - name: Generate monthly summary
+        if: steps.check_last_day.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.WIKI_PAT }}
+          GITHUB_ACTOR: ${{ vars.GITHUB_ACTOR || 'AntonMFernando-NOAA' }}
+          REPORT_MONTH: ${{ inputs.month }}
+        run: python generate_monthly_summary.py
+
+      - name: Push to wiki
+        if: steps.check_last_day.outputs.skip != 'true'
+        env:
+          WIKI_PAT: ${{ secrets.WIKI_PAT }}
+        run: |
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git clone https://x-access-token:${WIKI_PAT}@github.com/AntonMFernando-NOAA/wiki-automation.wiki.git wiki
+          cd wiki
+
+          # Create Monthly-Updates.md with header if it doesn't exist
+          if [ ! -f Monthly-Updates.md ]; then
+            printf '# Monthly Progress Reports\n\nAutomatically generated end-of-month progress reports.\n\n---\n\n' \
+              > Monthly-Updates.md
+          fi
+
+          # Prepend new entry (newest at top)
+          cat ../monthly_summary_patch.md Monthly-Updates.md > tmp_monthly.md
+          mv tmp_monthly.md Monthly-Updates.md
+
+          # Add sidebar link if missing
+          if [ ! -f _Sidebar.md ]; then
+            echo "* [[Home]]" > _Sidebar.md
+          fi
+          if ! grep -q 'Monthly-Updates' _Sidebar.md; then
+            printf '\n* [[Monthly Progress Reports|Monthly-Updates]]\n' >> _Sidebar.md
+          fi
+
+          git add Monthly-Updates.md _Sidebar.md
+          git diff --cached --quiet \
+            || (git commit -m "Monthly wiki update: $(date -u +%Y-%m)" && git push)
