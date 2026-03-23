@@ -1,417 +1,261 @@
 #!/usr/bin/env python3
 """
-Generate a weekly activity summary with narrative and context.
+Generate a weekly summary with a PR table and a narrative work summary.
+
+The narrative is generated via the GitHub Models API (gpt-4o-mini) and falls
+back to a template-based paragraph when the API is unavailable.
 
 Environment variables:
-    GH_TOKEN         PAT with repo read scope.
-    GITHUB_ACTOR     GitHub organization/user to track (default: AntonMFernando-NOAA)
-    WEEK_START       ISO date (YYYY-MM-DD). Defaults to last Monday.
+    GH_TOKEN        PAT with repo read scope (also used for GitHub Models).
+    GITHUB_ACTOR    GitHub username to track (default: AntonMFernando-NOAA).
+    WEEK_START      ISO date (YYYY-MM-DD) of the Monday. Defaults to last Monday.
 """
 
-import os
-import sys
-import requests
+import os, sys, re, requests
 from datetime import date, timedelta, timezone, datetime
 from collections import defaultdict
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 TOKEN = os.environ.get("GH_TOKEN", "")
 if not TOKEN:
     sys.exit("Error: GH_TOKEN is not set.")
 
 GITHUB_ACTOR = os.environ.get("GITHUB_ACTOR", "AntonMFernando-NOAA")
-WEEK_START_STR = os.environ.get("WEEK_START", "").strip()
 
-# Calculate week start (last Monday) if not provided
+WEEK_START_STR = os.environ.get("WEEK_START", "").strip()
 if WEEK_START_STR:
-    WEEK_START_DATE = date.fromisoformat(WEEK_START_STR)
+    MONDAY = date.fromisoformat(WEEK_START_STR)
 else:
     today = date.today()
-    days_since_monday = (today.weekday()) % 7
-    WEEK_START_DATE = today - timedelta(days=days_since_monday)
+    MONDAY = today - timedelta(days=today.weekday())  # last Monday
 
-WEEK_END_DATE = WEEK_START_DATE + timedelta(days=6)  # Sunday
+FRIDAY = MONDAY + timedelta(days=4)
 
-WEEK_START = datetime(WEEK_START_DATE.year, WEEK_START_DATE.month, WEEK_START_DATE.day, 0, 0, 0, tzinfo=timezone.utc)
-WEEK_END = datetime(WEEK_END_DATE.year, WEEK_END_DATE.month, WEEK_END_DATE.day, 23, 59, 59, tzinfo=timezone.utc)
+WEEK_START = datetime(MONDAY.year, MONDAY.month, MONDAY.day,  0,  0,  0, tzinfo=timezone.utc)
+WEEK_END   = datetime(FRIDAY.year, FRIDAY.month,  FRIDAY.day, 23, 59, 59, tzinfo=timezone.utc)
 
-HEADERS = {
+GH_HEADERS = {
     "Authorization": f"Bearer {TOKEN}",
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── GitHub REST helper ────────────────────────────────────────────────────────
 def gh_get(url, params=None):
-    """Paginated GitHub API GET request."""
     results, p = [], {"per_page": 100, **(params or {})}
     while url:
-        r = requests.get(url, headers=HEADERS, params=p)
+        r = requests.get(url, headers=GH_HEADERS, params=p)
         r.raise_for_status()
-        results.extend(r.json() if isinstance(r.json(), list) else [r.json()])
-        url = r.links.get("next", {}).get("url")
-        p = None  # Only send params on first request
+        data = r.json()
+        if isinstance(data, dict) and "items" in data:
+            results.extend(data["items"])
+        elif isinstance(data, list):
+            results.extend(data)
+        else:
+            results.append(data)
+        url, p = None, {}
+        for part in r.headers.get("Link", "").split(","):
+            if 'rel="next"' in part:
+                url = part.split(";")[0].strip().strip("<>")
     return results
 
-def parse_iso(iso_str):
-    """Parse ISO timestamp."""
-    if not iso_str:
-        return None
-    try:
-        return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    except Exception:
-        return None
+def in_window(dt_str):
+    if not dt_str:
+        return False
+    dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    return WEEK_START <= dt <= WEEK_END
 
-def discover_repos():
-    """Discover all repositories the user owns or contributes to."""
-    repos = set()
-    
-    # Owned repos
-    try:
-        owned = gh_get(f"https://api.github.com/users/{GITHUB_ACTOR}/repos")
-        repos.update(r['full_name'] for r in owned if not r.get('fork'))
-    except Exception as e:
-        print(f"Warning: Could not fetch owned repos: {e}", file=sys.stderr)
-    
-    # Recent commits on any repo
-    try:
-        since = WEEK_START.isoformat()
-        events = gh_get(f"https://api.github.com/users/{GITHUB_ACTOR}/events", {"per_page": 100})
-        for event in events:
-            created = parse_iso(event.get('created_at'))
-            if created and created >= WEEK_START - timedelta(days=7):
-                if 'repo' in event and 'name' in event['repo']:
-                    repos.add(event['repo']['name'])
-    except Exception as e:
-        print(f"Warning: Could not fetch events: {e}", file=sys.stderr)
-    
-    return sorted(repos)
+# ── Collect PRs via search API ────────────────────────────────────────────────
+all_prs = []
 
-# ── Activity Collection ───────────────────────────────────────────────────────
-def collect_week_activity(repos):
-    """Collect all activity for the week."""
-    activity = {
-        'commits': [],
-        'commit_messages': defaultdict(list),
-        'prs_merged': [],
-        'prs_opened': [],
-        'prs_reviewed': [],
-        'issues_opened': [],
-        'issues_closed': [],
-        'issue_comments': [],
-        'pr_comments': [],
-        'repos_active': set(),
-    }
-    
-    for repo in repos:
+# Merged this week
+try:
+    start_str = MONDAY.strftime("%Y-%m-%d")
+    end_str   = FRIDAY.strftime("%Y-%m-%d")
+    for item in gh_get(
+        "https://api.github.com/search/issues",
+        {"q": f"author:{GITHUB_ACTOR} is:pr is:merged merged:{start_str}..{end_str}"},
+    ):
+        repo = item.get("repository_url", "").replace("https://api.github.com/repos/", "")
+        all_prs.append({
+            "repo":   repo.split("/")[-1],
+            "number": item["number"],
+            "title":  item["title"],
+            "state":  "merged",
+            "branch": "",
+            "body":   (item.get("body") or "")[:300],
+            "url":    item["html_url"],
+        })
+except Exception as e:
+    print(f"Warning — merged PRs search: {e}", file=sys.stderr)
+
+# Open PRs updated this week
+try:
+    for item in gh_get(
+        "https://api.github.com/search/issues",
+        {"q": f"author:{GITHUB_ACTOR} is:pr is:open updated:{start_str}..{end_str}"},
+    ):
+        repo = item.get("repository_url", "").replace("https://api.github.com/repos/", "")
+        all_prs.append({
+            "repo":   repo.split("/")[-1],
+            "number": item["number"],
+            "title":  item["title"],
+            "state":  "open",
+            "branch": "",
+            "body":   (item.get("body") or "")[:300],
+            "url":    item["html_url"],
+        })
+except Exception as e:
+    print(f"Warning — open PRs search: {e}", file=sys.stderr)
+
+# ── Collect commits for narrative context ─────────────────────────────────────
+commit_messages = []
+try:
+    repos = gh_get(
+        f"https://api.github.com/users/{GITHUB_ACTOR}/repos",
+        {"type": "all", "sort": "updated"},
+    )
+    for repo_data in repos[:20]:  # cap at 20 most-recently-updated repos
+        if repo_data.get("archived"):
+            continue
+        repo_full = f"{repo_data['owner']['login']}/{repo_data['name']}"
         try:
-            print(f"  Checking {repo}...", file=sys.stderr)
-            
-            # Commits
-            try:
-                since_str = WEEK_START.isoformat()
-                until_str = WEEK_END.isoformat()
-                commits = gh_get(f"https://api.github.com/repos/{repo}/commits",
-                               {"author": GITHUB_ACTOR, "since": since_str, "until": until_str})
-                for commit in commits:
-                    activity['commits'].append({
-                        'repo': repo,
-                        'sha': commit['sha'][:7],
-                        'message': commit['commit']['message'].split('\n')[0],  # First line only
-                        'url': commit['html_url']
-                    })
-                    activity['commit_messages'][repo].append(commit['commit']['message'].split('\n')[0])
-                    activity['repos_active'].add(repo)
-            except Exception as e:
-                print(f"    Warning: Could not fetch commits: {e}", file=sys.stderr)
-            
-            # Pull Requests
-            try:
-                prs = gh_get(f"https://api.github.com/repos/{repo}/pulls", {"state": "all"})
-                for pr in prs:
-                    created = parse_iso(pr.get('created_at'))
-                    merged = parse_iso(pr.get('merged_at'))
-                    closed = parse_iso(pr.get('closed_at'))
-                    
-                    if created and WEEK_START <= created <= WEEK_END and pr['user']['login'] == GITHUB_ACTOR:
-                        activity['prs_opened'].append({
-                            'repo': repo,
-                            'number': pr['number'],
-                            'title': pr['title'],
-                            'url': pr['html_url']
-                        })
-                        activity['repos_active'].add(repo)
-                    
-                    if merged and WEEK_START <= merged <= WEEK_END and pr['user']['login'] == GITHUB_ACTOR:
-                        activity['prs_merged'].append({
-                            'repo': repo,
-                            'number': pr['number'],
-                            'title': pr['title'],
-                            'url': pr['html_url']
-                        })
-                        activity['repos_active'].add(repo)
-            except Exception as e:
-                print(f"    Warning: Could not fetch PRs: {e}", file=sys.stderr)
-            
-            # Issues
-            try:
-                issues = gh_get(f"https://api.github.com/repos/{repo}/issues", {"state": "all", "creator": GITHUB_ACTOR})
-                for issue in issues:
-                    # Skip PRs (they appear in issues API too)
-                    if 'pull_request' in issue:
-                        continue
-                    
-                    created = parse_iso(issue.get('created_at'))
-                    closed = parse_iso(issue.get('closed_at'))
-                    
-                    if created and WEEK_START <= created <= WEEK_END:
-                        activity['issues_opened'].append({
-                            'repo': repo,
-                            'number': issue['number'],
-                            'title': issue['title'],
-                            'url': issue['html_url']
-                        })
-                        activity['repos_active'].add(repo)
-                    
-                    if closed and WEEK_START <= closed <= WEEK_END:
-                        activity['issues_closed'].append({
-                            'repo': repo,
-                            'number': issue['number'],
-                            'title': issue['title'],
-                            'url': issue['html_url']
-                        })
-                        activity['repos_active'].add(repo)
-            except Exception as e:
-                print(f"    Warning: Could not fetch issues: {e}", file=sys.stderr)
-            
-            # Issue Comments
-            try:
-                since_str = WEEK_START.isoformat()
-                comments = gh_get(f"https://api.github.com/repos/{repo}/issues/comments", {"since": since_str})
-                for comment in comments:
-                    if comment['user']['login'] == GITHUB_ACTOR:
-                        created = parse_iso(comment['created_at'])
-                        if created and WEEK_START <= created <= WEEK_END:
-                            activity['issue_comments'].append({
-                                'repo': repo,
-                                'url': comment['html_url'],
-                                'body': comment['body'][:100]  # First 100 chars
-                            })
-                            activity['repos_active'].add(repo)
-            except Exception as e:
-                print(f"    Warning: Could not fetch issue comments: {e}", file=sys.stderr)
-            
-            # PR Reviews
-            try:
-                prs_all = gh_get(f"https://api.github.com/repos/{repo}/pulls", {"state": "all"})
-                for pr in prs_all:
-                    try:
-                        reviews = gh_get(f"https://api.github.com/repos/{repo}/pulls/{pr['number']}/reviews")
-                        for review in reviews:
-                            if review['user']['login'] == GITHUB_ACTOR:
-                                submitted = parse_iso(review.get('submitted_at'))
-                                if submitted and WEEK_START <= submitted <= WEEK_END:
-                                    activity['prs_reviewed'].append({
-                                        'repo': repo,
-                                        'number': pr['number'],
-                                        'title': pr['title'],
-                                        'state': review['state'],
-                                        'url': review['html_url']
-                                    })
-                                    activity['repos_active'].add(repo)
-                    except Exception:
-                        pass  # PR might not have reviews
-            except Exception as e:
-                print(f"    Warning: Could not fetch PR reviews: {e}", file=sys.stderr)
-            
-            # PR Review Comments
-            try:
-                since_str = WEEK_START.isoformat()
-                comments = gh_get(f"https://api.github.com/repos/{repo}/pulls/comments", {"since": since_str})
-                for comment in comments:
-                    if comment['user']['login'] == GITHUB_ACTOR:
-                        created = parse_iso(comment['created_at'])
-                        if created and WEEK_START <= created <= WEEK_END:
-                            activity['pr_comments'].append({
-                                'repo': repo,
-                                'url': comment['html_url'],
-                                'body': comment['body'][:100]
-                            })
-                            activity['repos_active'].add(repo)
-            except Exception as e:
-                print(f"    Warning: Could not fetch PR comments: {e}", file=sys.stderr)
-                
-        except Exception as e:
-            print(f"Warning: Error processing {repo}: {e}", file=sys.stderr)
-    
-    return activity
+            for c in gh_get(
+                f"https://api.github.com/repos/{repo_full}/commits",
+                {"since": WEEK_START.isoformat(), "until": WEEK_END.isoformat(), "author": GITHUB_ACTOR},
+            ):
+                msg = c["commit"]["message"].splitlines()[0]
+                if not re.match(r"^merge\b", msg, re.I):
+                    commit_messages.append(msg)
+        except Exception:
+            pass
+except Exception as e:
+    print(f"Warning — commits: {e}", file=sys.stderr)
 
-# ── Summary Generation ────────────────────────────────────────────────────────
-def generate_commit_themes(commit_messages):
-    """Extract themes from commit messages."""
-    themes = defaultdict(list)
-    
-    for repo, messages in commit_messages.items():
-        repo_short = repo.split('/')[-1]
-        for msg in messages:
-            msg_lower = msg.lower()
-            # Simple keyword extraction
-            if any(kw in msg_lower for kw in ['fix', 'bug', 'error', 'issue']):
-                themes['Bug Fixes'].append(f"{repo_short}: {msg}")
-            elif any(kw in msg_lower for kw in ['add', 'new', 'implement', 'create']):
-                themes['New Features'].append(f"{repo_short}: {msg}")
-            elif any(kw in msg_lower for kw in ['update', 'change', 'modify', 'refactor']):
-                themes['Updates'].append(f"{repo_short}: {msg}")
-            elif any(kw in msg_lower for kw in ['doc', 'readme', 'comment']):
-                themes['Documentation'].append(f"{repo_short}: {msg}")
-            elif any(kw in msg_lower for kw in ['test', 'ci', 'build']):
-                themes['CI/Testing'].append(f"{repo_short}: {msg}")
-            else:
-                themes['Other Changes'].append(f"{repo_short}: {msg}")
-    
-    return themes
+# ── Narrative via GitHub Models ───────────────────────────────────────────────
+def _template_narrative(prs):
+    if not prs:
+        return (
+            f"No pull request activity was recorded for the week of "
+            f"{MONDAY.strftime('%B %d')}–{FRIDAY.strftime('%B %d, %Y')}."
+        )
+    repos_mentioned = sorted({p["repo"] for p in prs})
+    open_prs   = [p for p in prs if p["state"] == "open"]
+    merged_prs = [p for p in prs if p["state"] == "merged"]
 
-def generate_narrative(activity):
-    """Generate narrative summary of the week."""
     parts = []
-    
-    total_commits = len(activity['commits'])
-    num_repos = len(activity['repos_active'])
-    
-    # Primary narrative
-    if total_commits > 0:
-        repo_names = [r.split('/')[-1] for r in sorted(activity['repos_active'])]
-        parts.append(f"Active development week with **{total_commits} commits** across {num_repos} {'repository' if num_repos == 1 else 'repositories'} ({', '.join(repo_names)})")
-    
-    # PR activity
-    if activity['prs_merged']:
-        parts.append(f"**{len(activity['prs_merged'])} PR{'s' if len(activity['prs_merged']) > 1 else ''} merged**")
-    if activity['prs_opened'] and len(activity['prs_opened']) != len(activity['prs_merged']):
-        parts.append(f"**{len(activity['prs_opened'])} PR{'s' if len(activity['prs_opened']) > 1 else ''} opened**")
-    
-    # Issues
-    if activity['issues_opened']:
-        parts.append(f"**{len(activity['issues_opened'])} issue{'s' if len(activity['issues_opened']) > 1 else ''} opened**")
-    if activity['issues_closed']:
-        parts.append(f"**{len(activity['issues_closed'])} issue{'s' if len(activity['issues_closed']) > 1 else ''} closed**")
-    
-    # Collaboration
-    collab = []
-    if activity['prs_reviewed']:
-        collab.append(f"{len(activity['prs_reviewed'])} PR review{'s' if len(activity['prs_reviewed']) > 1 else ''}")
-    if activity['issue_comments']:
-        collab.append(f"{len(activity['issue_comments'])} issue comment{'s' if len(activity['issue_comments']) > 1 else ''}")
-    if activity['pr_comments']:
-        collab.append(f"{len(activity['pr_comments'])} PR comment{'s' if len(activity['pr_comments']) > 1 else ''}")
-    
-    if collab:
-        parts.append(f"Collaboration: {', '.join(collab)}")
-    
-    if not parts:
-        return "Quiet week - focus on planning and design work."
-    
-    return ". ".join(parts) + "."
+    titles_short = "; ".join(p["title"][:70] for p in prs[:3])
+    parts.append(f"This week's work covered: {titles_short}.")
+    pr_summary = []
+    if merged_prs:
+        pr_summary.append(f"{len(merged_prs)} PR{'s' if len(merged_prs) > 1 else ''} merged")
+    if open_prs:
+        pr_summary.append(f"{len(open_prs)} PR{'s' if len(open_prs) > 1 else ''} open")
+    if pr_summary:
+        parts.append(f"Overall, {' and '.join(pr_summary)} across {', '.join(repos_mentioned)}.")
+    return " ".join(parts)
 
-def write_summary(activity):
-    """Write weekly summary to file."""
-    output = []
-    
-    # Week header
-    week_num = WEEK_START_DATE.isocalendar()[1]
-    output.append(f"## Week of {WEEK_START_DATE.strftime('%B %d, %Y')} (Week {week_num})\n")
-    
-    # Narrative
-    narrative = generate_narrative(activity)
-    output.append(f"{narrative}\n")
-    
-    # Work Summary (themes from commits)
-    if activity['commit_messages']:
-        themes = generate_commit_themes(activity['commit_messages'])
-        if themes:
-            output.append("\n### Work Summary\n")
-            for theme, items in sorted(themes.items()):
-                if items:
-                    output.append(f"\n**{theme}**\n")
-                    for item in items[:5]:  # Top 5 per category
-                        output.append(f"- {item}\n")
-                    if len(items) > 5:
-                        output.append(f"- _{len(items) - 5} more..._\n")
-    
-    # Key Pull Requests
-    if activity['prs_merged'] or activity['prs_opened']:
-        output.append("\n### Pull Requests\n")
-        if activity['prs_merged']:
-            output.append("\n**Merged:**\n")
-            for pr in activity['prs_merged'][:10]:
-                output.append(f"- [{pr['repo'].split('/')[-1]}#{pr['number']}]({pr['url']}): {pr['title']}\n")
-        if activity['prs_opened']:
-            unmerged = [pr for pr in activity['prs_opened'] if pr not in activity['prs_merged']]
-            if unmerged:
-                output.append("\n**Opened:**\n")
-                for pr in unmerged[:10]:
-                    output.append(f"- [{pr['repo'].split('/')[-1]}#{pr['number']}]({pr['url']}): {pr['title']}\n")
-    
-    # Issues
-    if activity['issues_opened'] or activity['issues_closed']:
-        output.append("\n### Issues\n")
-        if activity['issues_opened']:
-            output.append("\n**Opened:**\n")
-            for issue in activity['issues_opened'][:10]:
-                output.append(f"- [{issue['repo'].split('/')[-1]}#{issue['number']}]({issue['url']}): {issue['title']}\n")
-        if activity['issues_closed']:
-            output.append("\n**Closed:**\n")
-            for issue in activity['issues_closed'][:10]:
-                output.append(f"- [{issue['repo'].split('/')[-1]}#{issue['number']}]({issue['url']}): {issue['title']}\n")
-    
-    # Reviews and Comments
-    if activity['prs_reviewed'] or activity['issue_comments'] or activity['pr_comments']:
-        output.append("\n### Collaboration Activity\n")
-        if activity['prs_reviewed']:
-            output.append(f"\n**Code Reviews ({len(activity['prs_reviewed'])}):**\n")
-            for review in activity['prs_reviewed'][:10]:
-                state_emoji = {"APPROVED": "✅", "CHANGES_REQUESTED": "🔄", "COMMENTED": "💬"}.get(review['state'], "👁️")
-                output.append(f"- {state_emoji} [{review['repo'].split('/')[-1]}#{review['number']}]({review['url']}): {review['title']}\n")
-        
-        total_comments = len(activity['issue_comments']) + len(activity['pr_comments'])
-        if total_comments:
-            output.append(f"\n**Comments:** {total_comments} ({len(activity['issue_comments'])} on issues, {len(activity['pr_comments'])} on PRs)\n")
-    
-    # Statistics (collapsed)
-    output.append("\n<details>\n<summary>Statistics</summary>\n\n")
-    output.append(f"- **Repositories Active**: {len(activity['repos_active'])}\n")
-    output.append(f"- **Total Commits**: {len(activity['commits'])}\n")
-    output.append(f"- **PRs**: {len(activity['prs_merged'])} merged, {len(activity['prs_opened'])} opened\n")
-    output.append(f"- **Issues**: {len(activity['issues_opened'])} opened, {len(activity['issues_closed'])} closed\n")
-    output.append(f"- **Reviews**: {len(activity['prs_reviewed'])}\n")
-    output.append(f"- **Comments**: {len(activity['issue_comments']) + len(activity['pr_comments'])}\n")
-    output.append("\n</details>\n")
-    
-    output.append("\n---\n\n")
-    
-    with open("weekly_summary_patch.md", "w") as f:
-        f.write("".join(output))
-    
-    print(f"✓ Weekly summary written for week {week_num} ({WEEK_START_DATE} to {WEEK_END_DATE})")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    print(f"Discovering repositories for {GITHUB_ACTOR}...")
-    repos = discover_repos()
-    print(f"Found {len(repos)} repositories")
-    
-    print(f"Collecting activity for week of {WEEK_START_DATE} to {WEEK_END_DATE}...")
-    activity = collect_week_activity(repos)
-    
-    print(f"\nActivity summary:")
-    print(f"  Commits: {len(activity['commits'])}")
-    print(f"  PRs merged: {len(activity['prs_merged'])}")
-    print(f"  PRs opened: {len(activity['prs_opened'])}")
-    print(f"  Issues opened: {len(activity['issues_opened'])}")
-    print(f"  Issues closed: {len(activity['issues_closed'])}")
-    print(f"  Reviews: {len(activity['prs_reviewed'])}")
-    print(f"  Comments: {len(activity['issue_comments']) + len(activity['pr_comments'])}")
-    
-    write_summary(activity)
+def generate_narrative(prs, commits):
+    if not prs and not commits:
+        return (
+            f"No activity was recorded for the week of "
+            f"{MONDAY.strftime('%B %d')}–{FRIDAY.strftime('%B %d, %Y')}."
+        )
 
-if __name__ == "__main__":
-    main()
+    pr_block = "\n".join(
+        f"- PR #{p['number']} ({p['state']}) [{p['repo']}]: {p['title']}"
+        + (f"\n  {p['body'][:200]}" if p["body"].strip() else "")
+        for p in prs
+    ) or "None"
+
+    commit_block = "\n".join(f"- {m}" for m in commits[:25]) or "None"
+
+    prompt = (
+        f"Below is the GitHub activity for the week of "
+        f"{MONDAY.strftime('%B %d')}–{FRIDAY.strftime('%B %d, %Y')}.\n\n"
+        f"Pull Requests:\n{pr_block}\n\n"
+        f"Recent commits:\n{commit_block}\n\n"
+        "Write a concise 3–5 sentence narrative work summary. "
+        "Focus on the themes and goals of the work, not individual commits. "
+        "Mention specific variable names, file types, or components only when they "
+        "are central to the PR descriptions. "
+        "Do NOT use bullet points. Write in plain prose as a single cohesive paragraph. "
+        "Output only the paragraph — no headings, no preamble."
+    )
+
+    try:
+        resp = requests.post(
+            "https://models.inference.ai.azure.com/chat/completions",
+            headers={
+                "Authorization": f"Bearer {TOKEN}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a concise technical writer summarising a software "
+                            "developer's weekly GitHub activity. Be specific about what "
+                            "was worked on; avoid generic filler sentences."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 350,
+                "temperature": 0.3,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"Warning — GitHub Models API unavailable ({e}); using template narrative.", file=sys.stderr)
+        return _template_narrative(prs)
+
+
+# ── PR table ──────────────────────────────────────────────────────────────────
+def status_label(state):
+    return {"open": "🟢 Open", "merged": "🟣 Merged", "closed": "🔴 Closed"}.get(state, state.title())
+
+
+def build_pr_table(prs):
+    if not prs:
+        return "_No pull requests this week._\n"
+    rows = [
+        "| # | Repository | Title | Status |",
+        "|---|------------|-------|--------|",
+    ]
+    for p in prs:
+        rows.append(
+            f"| [#{p['number']}]({p['url']}) | {p['repo']} | {p['title']} | {status_label(p['state'])} |"
+        )
+    return "\n".join(rows) + "\n"
+
+
+# ── Build output ──────────────────────────────────────────────────────────────
+narrative = generate_narrative(all_prs, commit_messages)
+pr_table  = build_pr_table(all_prs)
+
+output = "\n".join([
+    f"## Week of {MONDAY.strftime('%B %d')}–{FRIDAY.strftime('%d, %Y')}\n"
+    f"_Automatically maintained log of weekly activity across NOAA-EMC/global-workflow._",
+    "",
+    "### 🔀 Pull Requests",
+    pr_table,
+    "### 💾 Work Summary",
+    narrative,
+    "",
+    "---",
+    "",
+])
+
+with open("weekly_summary_patch.md", "w") as f:
+    f.write(output)
+
+print(
+    f"Weekly summary written: {MONDAY} to {FRIDAY}  |  "
+    f"{len(all_prs)} PRs  |  {len(commit_messages)} commits"
+)
