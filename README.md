@@ -1,101 +1,148 @@
-# Daily Wiki Update Automation — Setup Guide
+# GitHub Activity Wiki Automation — Setup Guide
 
-This folder contains the scripts and workflow configuration that automate a daily
-summary of GitHub activity (commits, pull requests, and issues) to the
-**AntonMFernando-NOAA/wiki-automation** wiki.
+Automatically post **daily, weekly, and monthly summaries** of your GitHub
+activity (commits, pull requests, and issues) to your repository's wiki.
+Summaries are generated as narrative paragraphs using the GitHub Models API
+(gpt-4o-mini) with a plain-text fallback — no external services or API keys
+required beyond a standard GitHub PAT.
+
+Great for tracking your own work and producing progress reports with minimal
+effort.
+
+---
+
+## What it produces
+
+| Workflow | Schedule | Wiki page |
+|----------|----------|-----------|
+| Daily summary | Mon–Fri at 06:00 UTC | `Daily-Updates.md` |
+| Weekly summary | Every Monday at 07:00 UTC | `Weekly-Updates.md` |
+| Monthly summary | 1st of each month at 08:00 UTC | `Monthly-Updates.md` |
+
+All workflows can also be triggered manually for any date range.
 
 ---
 
 ## Repository structure
 
-The automation lives in `AntonMFernando-NOAA/wiki-automation`:
-
 ```
-wiki-automation/
+your-wiki-automation-repo/
 ├── .github/workflows/
-│   ├── daily-wiki-update.yml     # runs Mon–Fri at 06:00 UTC
+│   ├── daily-wiki-update.yml
 │   ├── weekly-wiki-update.yml
 │   └── monthly-wiki-update.yml
-├── generate_daily_summary.py     # script called by the daily workflow
+├── generate_daily_summary.py
 ├── generate_weekly_summary.py
 └── generate_monthly_summary.py
 ```
 
 ---
 
-## One-time setup
+## Setup
 
-### 1. Create a Personal Access Token (PAT)
+### 1. Fork or copy this repository
+
+Fork `AntonMFernando-NOAA/wiki-automation` into your own GitHub account, or
+copy the files into a new repository. The repository must be **public** or you
+must have a paid plan for GitHub Actions on private repos.
+
+### 2. Initialise the wiki
+
+GitHub wikis must have at least one page before automation can push to them.
+
+1. Go to your repo → **Wiki** tab → **Create the first page**.
+2. Set the title to `Home` and save.
+
+### 3. Create a Personal Access Token (PAT)
 
 1. Go to https://github.com/settings/tokens → **Generate new token (classic)**.
-2. Grant scopes: **`repo`** (full control), **`read:org`**.
-3. Copy the token. Avoid setting a short expiry — if it expires the workflow fails silently.
+2. Grant scopes: **`repo`** (full control) and **`read:org`**.
+3. Set expiry to at least 90 days (or no expiry). **If it expires, the workflow
+   will fail silently.**
+4. Copy the token.
 
-### 2. Add the PAT as a repository secret
+### 4. Add the PAT as a repository secret
 
-In `AntonMFernando-NOAA/wiki-automation` → **Settings → Secrets and variables → Actions → Secrets**:
+In your repo → **Settings → Secrets and variables → Actions → Secrets → New repository secret**:
 
 | Name | Value |
 |------|-------|
-| `WIKI_PAT` | The PAT created above |
+| `WIKI_PAT` | The PAT you just created |
 
-### 3. Ensure the wiki has at least one page
+### 5. (Optional) Set your GitHub username as a variable
 
-GitHub wikis must be initialised before the workflow can push to them.  
-Go to https://github.com/AntonMFernando-NOAA/wiki-automation/wiki and create a `Home` page if one does not exist.
+By default the scripts track the account that owns the repository. To track a
+different username, add a repository variable:
 
-### 4. Enable Actions with write permissions
+In your repo → **Settings → Secrets and variables → Actions → Variables → New repository variable**:
 
-In `AntonMFernando-NOAA/wiki-automation` → **Settings → Actions → General → Workflow permissions**:
-- Select **Read and write permissions**.
+| Name | Value |
+|------|-------|
+| `GITHUB_ACTOR` | Your GitHub username (e.g. `octocat`) |
+
+### 6. Enable Actions with write permissions
+
+In your repo → **Settings → Actions → General → Workflow permissions**:
+- Select **Read and write permissions** → **Save**.
+
+### 7. Enable the workflows
+
+The workflow files in `.github/workflows/` will be picked up automatically by
+GitHub Actions. You can verify they appear under the **Actions** tab of your
+repo.
 
 ---
 
-## Environment variables used by the scripts
+## Environment variables reference
 
-| Variable | Source | Purpose |
-|----------|--------|---------|
-| `GH_TOKEN` | `secrets.WIKI_PAT` | GitHub API access + GitHub Models API |
-| `GITHUB_ACTOR` | `vars.GITHUB_ACTOR` or hardcoded default `AntonMFernando-NOAA` | Username to track |
-| `SUMMARY_DATE` | `inputs.date` (optional) | Override date; defaults to yesterday |
+| Variable | Set via | Purpose |
+|----------|---------|---------|
+| `GH_TOKEN` | `secrets.WIKI_PAT` | GitHub API access + GitHub Models narrative generation |
+| `GITHUB_ACTOR` | `vars.GITHUB_ACTOR` (optional) | GitHub username to track; defaults to repo owner |
+| `SUMMARY_DATE` | Manual workflow input (optional) | Override the target date; defaults to yesterday |
+| `WEEK_START` | Manual workflow input (optional) | Override the week start date (weekly workflow) |
+| `REPORT_MONTH` | Manual workflow input (optional) | Override the report month `YYYY-MM` (monthly workflow) |
 
-No `REPOS` or `WIKI_AUTHOR_USERNAME` variables are needed — the scripts
-auto-discover repositories owned by `GITHUB_ACTOR`.
+No hardcoded repository list is needed — the scripts automatically discover all
+non-archived repositories owned by the tracked user.
 
 ---
 
-## How the daily workflow works
+## Manual and backfill runs
+
+All three workflows support manual triggers. Go to:
+
+**Actions → [workflow name] → Run workflow**
+
+| Field | Example | Effect |
+|-------|---------|--------|
+| Date (daily) | `2026-03-20` | Summarise that specific day |
+| Week start (weekly) | `2026-03-16` | Summarise the week starting on that Monday |
+| Month (monthly) | `2026-02` | Summarise that calendar month |
+
+Leave fields blank to use the default (yesterday / last week / last month).
+Manual triggers are not restricted to the scheduled days.
+
+---
+
+## How it works
 
 ```
-Every weekday at 06:00 UTC (Mon–Fri)
+Scheduled trigger (or manual)
         │
         ▼
-GitHub Actions runner (wiki-automation repo)
-  1. Checks out the repo
-  2. Runs generate_daily_summary.py
+GitHub Actions runner
+  1. Checks out the repository
+  2. Runs the summary script
         ├── Discovers all non-archived repos under GITHUB_ACTOR
-        ├── Queries GitHub API for yesterday's commits, PRs, and issues
-        └── Writes daily_summary_patch.md
-  3. Clones wiki-automation.wiki.git
-  4. Prepends today's entry to Daily-Updates.md
-  5. Adds [[Daily Updates]] link to _Sidebar.md (once)
-  6. Commits and pushes the wiki
+        ├── Queries GitHub API for commits, PRs, and issues in the time window
+        ├── Calls GitHub Models API (gpt-4o-mini) for a narrative paragraph
+        │   (falls back to a template paragraph if the API is unavailable)
+        └── Writes <type>_summary_patch.md
+  3. Clones <your-repo>.wiki.git
+  4. Prepends the new entry to the relevant wiki page
+  5. Commits and pushes the wiki
 ```
-
-The wiki page `Daily-Updates.md` grows with the newest entries at the top.
-
-**Wiki location:** https://github.com/AntonMFernando-NOAA/wiki-automation/wiki/Daily-Updates
-
----
-
-## Manual / backfill run
-
-Trigger the workflow manually from:
-**Actions → Daily Wiki Update → Run workflow**
-https://github.com/AntonMFernando-NOAA/wiki-automation/actions/workflows/daily-wiki-update.yml
-
-Supply a specific date (e.g. `2026-03-20`) to backfill a missed day.  
-The manual trigger works on any day — it is not restricted to weekdays.
 
 ---
 
@@ -104,9 +151,10 @@ The manual trigger works on any day — it is not restricted to weekdays.
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | `Error: GH_TOKEN is not set` | `WIKI_PAT` secret missing or expired | Regenerate PAT and update the secret |
-| `403` on `git push` | Workflow permissions not set to read/write | Settings → Actions → Workflow permissions → Read and write |
-| `fatal: could not read from remote` | Wiki not initialised | Create at least one wiki page manually |
-| No activity in summary | PAT lacks `repo` or `read:org` scope | Regenerate PAT with correct scopes |
+| `403` on `git push` to wiki | Workflow permissions not set to read/write | Settings → Actions → Workflow permissions → Read and write |
+| `fatal: could not read from remote` | Wiki not initialised | Create at least one wiki page manually first |
+| No activity in summary | PAT lacks `repo` or `read:org` scope | Regenerate PAT with the correct scopes |
+| Workflow not visible under Actions | Workflow YAML not in `.github/workflows/` | Confirm files are committed to the default branch |
 
 ---
 
@@ -114,6 +162,7 @@ The manual trigger works on any day — it is not restricted to weekdays.
 
 | What | Where |
 |------|-------|
-| Change schedule | Edit `cron` in `.github/workflows/daily-wiki-update.yml` |
-| Track a different user | Set `GITHUB_ACTOR` repo variable in Settings → Variables |
-| Change wiki page name | Edit the `Daily-Updates.md` references in the workflow's push step |
+| Change schedule | Edit the `cron` expression in the relevant workflow YAML |
+| Track additional users | Modify `GITHUB_ACTOR` to a comma-separated list (requires script change) |
+| Change wiki page names | Edit the filename references in the workflow's push step |
+| Adjust narrative style | Edit the prompt string inside `generate_*.py` |
