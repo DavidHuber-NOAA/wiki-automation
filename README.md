@@ -103,8 +103,10 @@ repo.
 | `WEEK_START` | Manual workflow input (optional) | Override the week start date (weekly workflow) |
 | `REPORT_MONTH` | Manual workflow input (optional) | Override the report month `YYYY-MM` (monthly workflow) |
 
-No hardcoded repository list is needed — the scripts automatically discover all
-non-archived repositories owned by the tracked user.
+No hardcoded repository list is needed. PRs and issues are found via GitHub's
+search API across all repositories. Commits are scanned from the 20
+most-recently-updated non-archived repos (daily/weekly) or all non-archived
+repos (monthly).
 
 ---
 
@@ -134,8 +136,9 @@ Scheduled trigger (or manual)
 GitHub Actions runner
   1. Checks out the repository
   2. Runs the summary script
-        ├── Discovers all non-archived repos under GITHUB_ACTOR
-        ├── Queries GitHub API for commits, PRs, and issues in the time window
+        ├── Searches GitHub for PRs and issues authored by GITHUB_ACTOR (all repos)
+        ├── Scans commits in the 20 most-recently-updated non-archived repos
+        │   (daily / weekly) or all non-archived repos (monthly)
         ├── Calls GitHub Models API (gpt-4o-mini) for a narrative paragraph
         │   (falls back to a template paragraph if the API is unavailable)
         └── Writes <type>_summary_patch.md
