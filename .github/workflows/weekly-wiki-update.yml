@@ -1,16 +1,12 @@
-# ============================================================
-# Weekly Wiki Update - Friday summaries
-# ============================================================
-
 name: Weekly Wiki Update
 
 on:
   schedule:
-    - cron: '59 23 * * 5'        # 23:59 UTC on Fridays (11:59 PM)
+    - cron: '59 19 * * 5'         # Every Friday at 19:59 UTC
   workflow_dispatch:
     inputs:
-      week_start:
-        description: 'Week start date (YYYY-MM-DD). Leave blank for last Monday.'
+      week_end:
+        description: 'Friday date of the week to summarise (YYYY-MM-DD). Defaults to today.'
         required: false
         default: ''
 
@@ -21,8 +17,12 @@ jobs:
       contents: read
 
     steps:
-      - name: Checkout repository
+      - name: Checkout scripts
         uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -30,14 +30,15 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests python-dateutil
+        run: pip install requests
 
       - name: Generate weekly summary
         env:
           GH_TOKEN: ${{ secrets.WIKI_PAT }}
-          GITHUB_ACTOR: ${{ vars.GITHUB_ACTOR || 'AntonMFernando-NOAA' }}
-          WEEK_START: ${{ inputs.week_start }}
-        run: python generate_weekly_summary.py
+          AUTHOR_USERNAME: ${{ vars.WIKI_AUTHOR_USERNAME }}
+          WEEK_END_DATE: ${{ inputs.week_end }}
+          REPOS: 'NOAA-EMC/global-workflow,NOAA-EMC/GDASapp'
+        run: python .github/scripts/generate_weekly_summary.py
 
       - name: Push to wiki
         env:
@@ -45,21 +46,24 @@ jobs:
         run: |
           git config --global user.name  "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Clone this repository's wiki
-          git clone https://x-access-token:${WIKI_PAT}@github.com/AntonMFernando-NOAA/wiki-automation.wiki.git wiki
+
+          git clone https://x-access-token:${WIKI_PAT}@github.com/AntonMFernando-NOAA/global-workflow.wiki.git wiki
           cd wiki
 
-          # Create Weekly-Updates.md if missing
           if [ ! -f Weekly-Updates.md ]; then
-            printf '# Weekly Updates\n\nAutomatically generated weekly activity summaries.\n\n---\n\n' \
-              > Weekly-Updates.md
+            printf '# Weekly Updates\n\nWeekly narrative summaries of work activity.\n\n---\n\n' > Weekly-Updates.md
           fi
 
-          # Prepend new entry (newest at top)
-          cat ../weekly_summary_patch.md Weekly-Updates.md > tmp_updates.md
-          mv tmp_updates.md Weekly-Updates.md
+          # Prepend new entry so newest week appears at the top
+          cat ../weekly_summary_patch.md Weekly-Updates.md > tmp.md
+          mv tmp.md Weekly-Updates.md
 
-          git add Weekly-Updates.md
+          # Add sidebar link once
+          if ! grep -q 'Weekly-Updates' _Sidebar.md 2>/dev/null; then
+            printf '\n* [[Weekly Updates|Weekly-Updates]]\n' >> _Sidebar.md
+          fi
+
+          git add Weekly-Updates.md _Sidebar.md
           git diff --cached --quiet \
-            || (git commit -m "Weekly wiki update: $(date -u +%Y-W%V)" && git push)
+            || git commit -m "Weekly wiki update: $(date -u +%Y-%m-%d)" \
+            && git push

@@ -1,13 +1,14 @@
 # ============================================================
-# Daily Wiki Update - Tracks all AntonMFernando-NOAA repos
-# Updates this repository's wiki (wiki-automation)
+# Daily Wiki Update
+# Place this file at:  .github/workflows/daily-wiki-update.yml
+# in the NOAA-EMC/global-workflow repository.
 # ============================================================
 
 name: Daily Wiki Update
 
 on:
   schedule:
-    - cron: '59 23 * * 1-5'       # 23:59 UTC Mon-Fri (11:59 PM) (weekdays only)
+    - cron: '59 19 * * 1-5'       # 19:59 UTC Mon-Fri (weekdays only)
   workflow_dispatch:
     inputs:
       date:
@@ -19,12 +20,18 @@ jobs:
   update-wiki:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: read            # read the workflow repo for the script
 
     steps:
-      - name: Checkout repository
+      # ── 1. Grab only the script from the source repo ─────────────────────
+      - name: Checkout scripts
         uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/scripts
+          sparse-checkout-cone-mode: false
 
+      # ── 2. Python environment ─────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -33,42 +40,43 @@ jobs:
       - name: Install dependencies
         run: pip install requests
 
+      # ── 3. Run the summary generator ─────────────────────────────────────
+      # Output file: daily_summary_patch.md  (created in $GITHUB_WORKSPACE)
       - name: Generate daily summary
         env:
           GH_TOKEN: ${{ secrets.WIKI_PAT }}
-          GITHUB_ACTOR: ${{ vars.GITHUB_ACTOR || 'AntonMFernando-NOAA' }}
+          AUTHOR_USERNAME: ${{ vars.WIKI_AUTHOR_USERNAME }}   # set in repo → Settings → Variables
           SUMMARY_DATE: ${{ inputs.date }}
-        run: python generate_daily_summary.py
+          REPOS: 'NOAA-EMC/global-workflow,NOAA-EMC/GDASapp'
+        run: python .github/scripts/generate_daily_summary.py
 
+      # ── 4. Clone wiki, prepend today's entry, push ────────────────────────
       - name: Push to wiki
         env:
           WIKI_PAT: ${{ secrets.WIKI_PAT }}
         run: |
           git config --global user.name  "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
-          # Clone this repository's wiki
-          git clone https://x-access-token:${WIKI_PAT}@github.com/AntonMFernando-NOAA/wiki-automation.wiki.git wiki
+
+          git clone https://x-access-token:${WIKI_PAT}@github.com/AntonMFernando-NOAA/global-workflow.wiki.git wiki
           cd wiki
 
-          # Create Daily-Updates.md with header if it doesn't exist
+          # Create Daily-Updates.md with a header if it doesn't exist yet
           if [ ! -f Daily-Updates.md ]; then
-            printf '# Daily Updates\n\nAutomatically generated daily activity summaries across all AntonMFernando-NOAA repositories.\n\n---\n\n' \
+            printf '# Daily Updates\n\nAutomatically generated daily activity summaries.\n\n---\n\n' \
               > Daily-Updates.md
           fi
 
-          # Prepend new entry (newest at top)
+          # Prepend new entry so the newest date always appears at the top
           cat ../daily_summary_patch.md Daily-Updates.md > tmp_updates.md
           mv tmp_updates.md Daily-Updates.md
 
-          # Add sidebar link if missing
-          if [ ! -f _Sidebar.md ]; then
-            echo "* [[Home]]" > _Sidebar.md
-          fi
+          # Add sidebar link once
           if ! grep -q 'Daily-Updates' _Sidebar.md; then
             printf '\n* [[Daily Updates|Daily-Updates]]\n' >> _Sidebar.md
           fi
 
           git add Daily-Updates.md _Sidebar.md
           git diff --cached --quiet \
-            || (git commit -m "Daily wiki update: $(date -u +%Y-%m-%d)" && git push)
+            || git commit -m "Daily wiki update: $(date -u +%Y-%m-%d)" \
+            && git push

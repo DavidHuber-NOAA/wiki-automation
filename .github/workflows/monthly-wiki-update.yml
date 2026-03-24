@@ -8,7 +8,7 @@ name: Monthly Wiki Update
 
 on:
   schedule:
-    - cron: '30 23 28-31 * *'   # 23:30 UTC on days 28-31; script guards last-day-only
+    - cron: '59 19 28-31 * *'    # 19:59 UTC on days 28-31; script guards last-day-only
   workflow_dispatch:
     inputs:
       month:
