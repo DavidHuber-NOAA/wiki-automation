@@ -107,7 +107,7 @@ def collect_merged_prs():
         return []
 
 def collect_branch_work():
-    """Collect commits on branches that have no PR, using push events."""
+    """Collect commits on all branches acoss all repos that have no open/merged PR."""
     import re as _re
     SKIP_RE = _re.compile(
         r"^(Merge (pull request|branch|remote-tracking branch|origin|remote)|"
@@ -115,8 +115,7 @@ def collect_branch_work():
         r"Bump version|Revert \"?Merge )",
         _re.I,
     )
-    branch_work: dict = {}   # {"repo/branch": [msg, ...]}
-    active_pr_branches: set = set()
+    branch_work: dict = {}
     default_branch_cache: dict = {}
 
     def _default_branch(rf):
@@ -128,37 +127,55 @@ def collect_branch_work():
                 default_branch_cache[rf] = "main"
         return default_branch_cache[rf]
 
-    try:
-        for event in gh_get(
-            f"https://api.github.com/users/{GITHUB_ACTOR}/events", {"per_page": 100}
-        ):
-            if event["type"] != "PushEvent":
-                continue
-            created = parse_iso(event["created_at"])
-            if not (created and MONTH_START <= created <= MONTH_END):
-                continue
-            repo_full = event["repo"]["name"]
-            branch    = event["payload"]["ref"].replace("refs/heads/", "")
-            msgs = [
-                c["message"].splitlines()[0]
-                for c in event["payload"].get("commits", [])
-                if not SKIP_RE.match(c["message"])
+    def _branch_msgs(rf, br):
+        try:
+            items = gh_get(
+                f"https://api.github.com/repos/{rf}/commits",
+                {"sha": br, "since": MONTH_START.isoformat(),
+                 "until": MONTH_END.isoformat(), "author": GITHUB_ACTOR},
+            )
+            return [
+                c["commit"]["message"].splitlines()[0]
+                for c in items
+                if not SKIP_RE.match(c["commit"]["message"])
             ]
-            if not msgs or branch == _default_branch(repo_full):
+        except Exception:
+            return []
+
+    try:
+        all_repos = gh_get(
+            f"https://api.github.com/users/{GITHUB_ACTOR}/repos",
+            {"type": "all", "sort": "updated"},
+        )
+        for repo_data in all_repos[:40]:
+            if repo_data.get("archived"):
                 continue
-            owner = repo_full.split("/")[0]
+            repo_full  = f"{repo_data['owner']['login']}/{repo_data['name']}"
+            default_br = _default_branch(repo_full)
+            owner      = repo_full.split("/")[0]
             try:
-                pr_list = gh_get(
-                    f"https://api.github.com/repos/{repo_full}/pulls",
-                    {"head": f"{owner}:{branch}", "state": "all"},
-                )
+                branches = gh_get(f"https://api.github.com/repos/{repo_full}/branches")
             except Exception:
-                pr_list = []
-            if not pr_list:
-                key = f"{repo_full.split('/')[-1]}/{branch}"
-                branch_work.setdefault(key, []).extend(msgs)
+                branches = []
+            for br_info in branches:
+                branch = br_info["name"]
+                if branch == default_br:
+                    continue
+                msgs = _branch_msgs(repo_full, branch)
+                if not msgs:
+                    continue
+                try:
+                    pr_list = gh_get(
+                        f"https://api.github.com/repos/{repo_full}/pulls",
+                        {"head": f"{owner}:{branch}", "state": "all"},
+                    )
+                except Exception:
+                    pr_list = []
+                if not pr_list:
+                    key = f"{repo_data['name']}/{branch}"
+                    branch_work.setdefault(key, []).extend(msgs)
     except Exception as e:
-        print(f"Warning — push events (branch work): {e}", file=sys.stderr)
+        print(f"Warning — repo/branch scan: {e}", file=sys.stderr)
     return branch_work
 
 # ── Narrative generation ──────────────────────────────────────────────────────
@@ -201,7 +218,7 @@ def generate_narrative(prs, commits, branch_work):
         f"Merged Pull Requests:\n{pr_block}\n\n"
         f"Commits on PR branches:\n{commit_block}\n\n"
         f"Branch work (commits on branches without a PR):\n{branch_block}\n\n"
-        "Write a concise 3–5 sentence narrative summary of the month's work. "
+        "Write a concise 3–5 sentence first-person narrative summary of the month's work (use 'I', not 'the developer'). "
         "Focus on the overall themes and goals, not individual items. "
         "Include work done directly in branches even if no PR was opened. "
         "Do NOT mention PR numbers, issue numbers, commit hashes, URLs, or weeks. "
@@ -223,12 +240,10 @@ def generate_narrative(prs, commits, branch_work):
                     {
                         "role": "system",
                         "content": (
-                            "You are a concise technical writer summarising a "
-                            "software developer's monthly GitHub activity into "
-                            "a single plain narrative paragraph. Be specific "
-                            "about what was worked on; avoid generic filler. "
-                            "Never mention PR numbers, issue numbers, commit "
-                            "hashes, URLs, or specific week dates."
+                            "You are writing a first-person monthly work log entry for a software developer. "
+                            "Write as 'I' — never say 'the developer' or 'they'. "
+                            "Be specific about what was worked on; avoid generic filler. "
+                            "Never mention PR numbers, issue numbers, commit hashes, URLs, or specific week dates."
                         ),
                     },
                     {"role": "user", "content": prompt},

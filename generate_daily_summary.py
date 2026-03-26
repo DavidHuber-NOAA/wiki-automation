@@ -123,8 +123,7 @@ try:
 except Exception as e:
     print(f"Warning — issues: {e}", file=sys.stderr)
 
-# ── Commit & branch-work collection via push events ─────────────────────────
-# Filters out merge/sync/update-branch noise commits
+# ── Commit & branch-work collection (full repo+branch scan) ────────────────────
 SKIP_RE = re.compile(
     r"^(Merge (pull request|branch|remote-tracking branch|origin|remote)|"
     r"Sync (from|with|branch)|Update(d)? (from|branch|changelog|version)|"
@@ -133,13 +132,12 @@ SKIP_RE = re.compile(
 )
 
 commit_messages    = []
-branch_work_commits: dict = {}   # {"repo/branch": [msg, ...]} – branches with no PR
-active_pr_branches: set  = set() # (repo_full, branch) pushed in window + has a PR
-_default_branch_cache: dict = {}  # repo_full -> default branch name
+branch_work_commits: dict = {}   # {"repo/branch": [msg, ...]} – no-PR branches
+active_pr_branches: set  = set() # (repo_full, branch) that have commits in window + a PR
+_default_branch_cache: dict = {}
 
 
 def _default_branch(repo_full):
-    """Return the default branch name for a repo (cached)."""
     if repo_full not in _default_branch_cache:
         try:
             r = requests.get(
@@ -151,47 +149,67 @@ def _default_branch(repo_full):
     return _default_branch_cache[repo_full]
 
 
-try:
-    for event in gh_get(
-        f"https://api.github.com/users/{GITHUB_ACTOR}/events", {"per_page": 100}
-    ):
-        if event["type"] != "PushEvent":
-            continue
-        created = datetime.fromisoformat(event["created_at"].replace("Z", "+00:00"))
-        if not (DAY_START <= created <= DAY_END):
-            continue
-        repo_full = event["repo"]["name"]
-        branch    = event["payload"]["ref"].replace("refs/heads/", "")
-        msgs = [
-            c["message"].splitlines()[0]
-            for c in event["payload"].get("commits", [])
-            if not SKIP_RE.match(c["message"])
+def _branch_msgs(repo_full, branch):
+    """Commits by GITHUB_ACTOR on branch within the day window, noise-filtered."""
+    try:
+        items = gh_get(
+            f"https://api.github.com/repos/{repo_full}/commits",
+            {"sha": branch, "since": DAY_START.isoformat(),
+             "until": DAY_END.isoformat(), "author": GITHUB_ACTOR},
+        )
+        return [
+            c["commit"]["message"].splitlines()[0]
+            for c in items
+            if not SKIP_RE.match(c["commit"]["message"])
         ]
-        if not msgs:
-            continue
-        # Commits directly to the default branch go straight to commit_messages
-        if branch == _default_branch(repo_full):
-            commit_messages.extend(msgs)
-            continue
-        # For other branches: check if a PR exists (open or merged)
-        owner = repo_full.split("/")[0]
-        try:
-            pr_list = gh_get(
-                f"https://api.github.com/repos/{repo_full}/pulls",
-                {"head": f"{owner}:{branch}", "state": "all"},
-            )
-        except Exception:
-            pr_list = []
-        if pr_list:
-            active_pr_branches.add((repo_full, branch))
-            commit_messages.extend(msgs)
-        else:
-            key = f"{repo_full.split('/')[-1]}/{branch}"
-            branch_work_commits.setdefault(key, []).extend(msgs)
-except Exception as e:
-    print(f"Warning — push events: {e}", file=sys.stderr)
+    except Exception:
+        return []
 
-# Mark which open PRs had commits pushed in this window (for narrative filtering)
+
+try:
+    all_repos = gh_get(
+        f"https://api.github.com/users/{GITHUB_ACTOR}/repos",
+        {"type": "all", "sort": "updated"},
+    )
+    for repo_data in all_repos[:40]:
+        if repo_data.get("archived"):
+            continue
+        repo_full  = f"{repo_data['owner']['login']}/{repo_data['name']}"
+        default_br = _default_branch(repo_full)
+        owner      = repo_full.split("/")[0]
+
+        # Default branch commits
+        commit_messages.extend(_branch_msgs(repo_full, default_br))
+
+        # All other branches
+        try:
+            branches = gh_get(f"https://api.github.com/repos/{repo_full}/branches")
+        except Exception:
+            branches = []
+        for br_info in branches:
+            branch = br_info["name"]
+            if branch == default_br:
+                continue
+            msgs = _branch_msgs(repo_full, branch)
+            if not msgs:
+                continue
+            try:
+                pr_list = gh_get(
+                    f"https://api.github.com/repos/{repo_full}/pulls",
+                    {"head": f"{owner}:{branch}", "state": "all"},
+                )
+            except Exception:
+                pr_list = []
+            if pr_list:
+                active_pr_branches.add((repo_full, branch))
+                commit_messages.extend(msgs)
+            else:
+                key = f"{repo_data['name']}/{branch}"
+                branch_work_commits.setdefault(key, []).extend(msgs)
+except Exception as e:
+    print(f"Warning — repo/branch scan: {e}", file=sys.stderr)
+
+# Mark which open PRs had commits in this window (for narrative filtering)
 for p in all_prs:
     if p["state"] != "open":
         continue
@@ -204,7 +222,7 @@ for p in all_prs:
         p["branch"]      = branch
         p["had_commits"] = bool(branch) and (p["repo_full"], branch) in active_pr_branches
     except Exception:
-        p["had_commits"] = True  # default: include if check fails
+        p["had_commits"] = True  # safe default: include in narrative
 
 # ── Narrative generation ──────────────────────────────────────────────────────
 def _template_narrative(prs, commits, branch_work):
@@ -248,7 +266,7 @@ def generate_narrative(prs, commits, branch_work):
         f"Pull Requests (with commits today):\n{pr_block}\n\n"
         f"Commits on PR branches:\n{commit_block}\n\n"
         f"Branch work (commits on branches without a PR):\n{branch_block}\n\n"
-        "Write a concise 2–4 sentence narrative work summary. "
+        "Write a concise 2–4 sentence first-person narrative work summary (use 'I', not 'the developer'). "
         "Describe the theme and purpose of the work, not individual commits. "
         "Include work done directly in branches even if no PR exists yet. "
         "Mention specific variable names, components, or files only when central to the changes. "
@@ -269,9 +287,9 @@ def generate_narrative(prs, commits, branch_work):
                     {
                         "role": "system",
                         "content": (
-                            "You are a concise technical writer summarising a software "
-                            "developer's daily GitHub activity. Be specific about what "
-                            "was worked on; avoid generic filler sentences."
+                            "You are writing a first-person daily work log entry for a software developer. "
+                            "Write as 'I' — never say 'the developer' or 'they'. "
+                            "Be specific about what was worked on; avoid generic filler sentences."
                         ),
                     },
                     {"role": "user", "content": prompt},
