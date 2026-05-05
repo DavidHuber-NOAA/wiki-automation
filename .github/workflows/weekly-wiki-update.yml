@@ -64,6 +64,7 @@ jobs:
           WIKI_PAT: ${{ secrets.WIKI_PAT }}
           REPO: ${{ github.repository }}
         run: |
+          set -x
           git config --global user.name  "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
